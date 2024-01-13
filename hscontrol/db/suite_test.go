@@ -1,0 +1,56 @@
+package db
+
+import (
+	"net/netip"
+	"os"
+	"testing"
+
+	"github.com/juanfont/headscale/hscontrol/notifier"
+	"gopkg.in/check.v1"
+)
+
+func Test(t *testing.T) {
+	check.TestingT(t)
+}
+
+var _ = check.Suite(&Suite{})
+
+type Suite struct{}
+
+var (
+	tmpDir string
+	db     *HSDatabase
+)
+
+func (s *Suite) SetUpTest(c *check.C) {
+	s.ResetDB(c)
+}
+
+func (s *Suite) TearDownTest(c *check.C) {
+	os.RemoveAll(tmpDir)
+}
+
+func (s *Suite) ResetDB(c *check.C) {
+	if len(tmpDir) != 0 {
+		os.RemoveAll(tmpDir)
+	}
+	var err error
+	tmpDir, err = os.MkdirTemp("", "autoygg-client-test")
+	if err != nil {
+		c.Fatal(err)
+	}
+
+	db, err = NewHeadscaleDatabase(
+		"sqlite3",
+		tmpDir+"/headscale_test.db",
+		false,
+		notifier.NewNotifier(),
+		[]netip.Prefix{
+			netip.MustParsePrefix("10.27.0.0/23"),
+		},
+		"",
+	)
+	if err != nil {
+		c.Fatal(err)
+	}
+}

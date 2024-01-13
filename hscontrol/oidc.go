@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	_ "embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -14,6 +15,9 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/gorilla/mux"
+	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/oauth2"
 	"tailscale.com/types/key"
@@ -21,16 +25,22 @@ import (
 
 const (
 	randomByteSize = 16
+)
 
-	errEmptyOIDCCallbackParams = Error("empty OIDC callback params")
-	errNoOIDCIDToken           = Error("could not extract ID Token for OIDC callback")
-	errOIDCAllowedDomains      = Error("authenticated principal does not match any allowed domain")
-	errOIDCAllowedGroups       = Error("authenticated principal is not in any allowed group")
-	errOIDCAllowedUsers        = Error("authenticated principal does not match any allowed user")
-	errOIDCInvalidMachineState = Error(
-		"requested machine state key expired before authorisation completed",
+var (
+	errEmptyOIDCCallbackParams = errors.New("empty OIDC callback params")
+	errNoOIDCIDToken           = errors.New("could not extract ID Token for OIDC callback")
+	errOIDCAllowedDomains      = errors.New(
+		"authenticated principal does not match any allowed domain",
 	)
-	errOIDCNodeKeyMissing = Error("could not get node key from cache")
+	errOIDCAllowedGroups = errors.New("authenticated principal is not in any allowed group")
+	errOIDCAllowedUsers  = errors.New(
+		"authenticated principal does not match any allowed user",
+	)
+	errOIDCInvalidNodeState = errors.New(
+		"requested node state key expired before authorisation completed",
+	)
+	errOIDCNodeKeyMissing = errors.New("could not get node key from cache")
 )
 
 type IDTokenClaims struct {
@@ -94,17 +104,14 @@ func (h *Headscale) RegisterOIDC(
 		Bool("ok", ok).
 		Msg("Received oidc register call")
 
-	if !NodePublicKeyRegex.Match([]byte(nodeKeyStr)) {
+	if !util.NodePublicKeyRegex.Match([]byte(nodeKeyStr)) {
 		log.Warn().Str("node_key", nodeKeyStr).Msg("Invalid node key passed to registration url")
 
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusUnauthorized)
 		_, err := writer.Write([]byte("Unauthorized"))
 		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return
@@ -115,7 +122,7 @@ func (h *Headscale) RegisterOIDC(
 	// the template and log an error.
 	var nodeKey key.NodePublic
 	err := nodeKey.UnmarshalText(
-		[]byte(NodePublicKeyEnsurePrefix(nodeKeyStr)),
+		[]byte(util.NodePublicKeyEnsurePrefix(nodeKeyStr)),
 	)
 
 	if !ok || nodeKeyStr == "" || err != nil {
@@ -127,10 +134,7 @@ func (h *Headscale) RegisterOIDC(
 		writer.WriteHeader(http.StatusBadRequest)
 		_, err := writer.Write([]byte("Wrong params"))
 		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return
@@ -138,9 +142,8 @@ func (h *Headscale) RegisterOIDC(
 
 	randomBlob := make([]byte, randomByteSize)
 	if _, err := rand.Read(randomBlob); err != nil {
-		log.Error().
-			Caller().
-			Msg("could not read 16 bytes from rand")
+		util.LogErr(err, "could not read 16 bytes from rand")
+
 		http.Error(writer, "Internal server error", http.StatusInternalServerError)
 
 		return
@@ -149,7 +152,11 @@ func (h *Headscale) RegisterOIDC(
 	stateStr := hex.EncodeToString(randomBlob)[:32]
 
 	// place the node key into the state cache, so it can be retrieved later
-	h.registrationCache.Set(stateStr, NodePublicKeyStripPrefix(nodeKey), registerCacheExpiration)
+	h.registrationCache.Set(
+		stateStr,
+		util.NodePublicKeyStripPrefix(nodeKey),
+		registerCacheExpiration,
+	)
 
 	// Add any extra parameter provided in the configuration to the Authorize Endpoint request
 	extras := make([]oauth2.AuthCodeOption, 0, len(h.cfg.OIDC.ExtraParams))
@@ -169,21 +176,17 @@ type oidcCallbackTemplateConfig struct {
 	Verb string
 }
 
+//go:embed assets/oidc_callback_template.html
+var oidcCallbackTemplateContent string
+
 var oidcCallbackTemplate = template.Must(
-	template.New("oidccallback").Parse(`<html>
-	<body>
-	<h1>headscale</h1>
-	<p>
-			{{.Verb}} as {{.User}}, you can now close this window.
-	</p>
-	</body>
-	</html>`),
+	template.New("oidccallback").Parse(oidcCallbackTemplateContent),
 )
 
 // OIDCCallback handles the callback from the OIDC endpoint
-// Retrieves the nkey from the state cache and adds the machine to the users email user
-// TODO: A confirmation page for new machines should be added to avoid phishing vulnerabilities
-// TODO: Add groups information from OIDC tokens into machine HostInfo
+// Retrieves the nkey from the state cache and adds the node to the users email user
+// TODO: A confirmation page for new nodes should be added to avoid phishing vulnerabilities
+// TODO: Add groups information from OIDC tokens into node HostInfo
 // Listens in /oidc/callback.
 func (h *Headscale) OIDCCallback(
 	writer http.ResponseWriter,
@@ -229,34 +232,39 @@ func (h *Headscale) OIDCCallback(
 		return
 	}
 
-	nodeKey, machineExists, err := h.validateMachineForOIDCCallback(
+	nodeKey, nodeExists, err := h.validateNodeForOIDCCallback(
 		writer,
 		state,
 		claims,
 		idTokenExpiry,
 	)
-	if err != nil || machineExists {
+	if err != nil || nodeExists {
 		return
 	}
 
-	userName, err := getUserName(writer, claims, h.cfg.OIDC.StripEmaildomain)
+	userName, err := getUserName(
+		writer,
+		claims,
+		h.cfg.OIDC.UseUsernameClaim,
+		h.cfg.OIDC.StripEmaildomain,
+	)
 	if err != nil {
 		return
 	}
 
-	// register the machine if it's new
-	log.Debug().Msg("Registering new machine after successful callback")
+	// register the node if it's new
+	log.Debug().Msg("Registering new node after successful callback")
 
 	user, err := h.findOrCreateNewUserForOIDCCallback(writer, userName)
 	if err != nil {
 		return
 	}
 
-	if err := h.registerMachineForOIDCCallback(writer, user, nodeKey, idTokenExpiry); err != nil {
+	if err := h.registerNodeForOIDCCallback(writer, user, nodeKey, idTokenExpiry); err != nil {
 		return
 	}
 
-	content, err := renderOIDCCallbackTemplate(writer, claims)
+	content, err := renderOIDCCallbackTemplate(writer, userName)
 	if err != nil {
 		return
 	}
@@ -264,10 +272,7 @@ func (h *Headscale) OIDCCallback(
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
 	if _, err := writer.Write(content.Bytes()); err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Msg("Failed to write response")
+		util.LogErr(err, "Failed to write response")
 	}
 }
 
@@ -283,10 +288,7 @@ func validateOIDCCallbackParams(
 		writer.WriteHeader(http.StatusBadRequest)
 		_, err := writer.Write([]byte("Wrong params"))
 		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return "", "", errEmptyOIDCCallbackParams
@@ -302,18 +304,12 @@ func (h *Headscale) getIDTokenForOIDCCallback(
 ) (string, error) {
 	oauth2Token, err := h.oauth2Config.Exchange(ctx, code)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Caller().
-			Msg("Could not exchange code for token")
+		util.LogErr(err, "Could not exchange code for token")
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusBadRequest)
 		_, werr := writer.Write([]byte("Could not exchange code for token"))
 		if werr != nil {
-			log.Error().
-				Caller().
-				Err(werr).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return "", err
@@ -331,10 +327,7 @@ func (h *Headscale) getIDTokenForOIDCCallback(
 		writer.WriteHeader(http.StatusBadRequest)
 		_, err := writer.Write([]byte("Could not extract ID Token"))
 		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return "", errNoOIDCIDToken
@@ -351,18 +344,12 @@ func (h *Headscale) verifyIDTokenForOIDCCallback(
 	verifier := h.oidcProvider.Verifier(&oidc.Config{ClientID: h.cfg.OIDC.ClientID})
 	idToken, err := verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Caller().
-			Msg("failed to verify id token")
+		util.LogErr(err, "failed to verify id token")
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusBadRequest)
 		_, werr := writer.Write([]byte("Failed to verify id token"))
 		if werr != nil {
-			log.Error().
-				Caller().
-				Err(werr).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return nil, err
@@ -377,18 +364,13 @@ func extractIDTokenClaims(
 ) (*IDTokenClaims, error) {
 	var claims IDTokenClaims
 	if err := idToken.Claims(&claims); err != nil {
-		log.Error().
-			Err(err).
-			Caller().
-			Msg("Failed to decode id token claims")
+		util.LogErr(err, "Failed to decode id token claims")
+
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusBadRequest)
 		_, werr := writer.Write([]byte("Failed to decode id token claims"))
 		if werr != nil {
-			log.Error().
-				Caller().
-				Err(werr).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return nil, err
@@ -406,16 +388,14 @@ func validateOIDCAllowedDomains(
 ) error {
 	if len(allowedDomains) > 0 {
 		if at := strings.LastIndex(claims.Email, "@"); at < 0 ||
-			!IsStringInSlice(allowedDomains, claims.Email[at+1:]) {
-			log.Error().Msg("authenticated principal does not match any allowed domain")
+			!util.IsStringInSlice(allowedDomains, claims.Email[at+1:]) {
+			log.Trace().Msg("authenticated principal does not match any allowed domain")
+
 			writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			writer.WriteHeader(http.StatusBadRequest)
 			_, err := writer.Write([]byte("unauthorized principal (domain mismatch)"))
 			if err != nil {
-				log.Error().
-					Caller().
-					Err(err).
-					Msg("Failed to write response")
+				util.LogErr(err, "Failed to write response")
 			}
 
 			return errOIDCAllowedDomains
@@ -436,20 +416,17 @@ func validateOIDCAllowedGroups(
 ) error {
 	if len(allowedGroups) > 0 {
 		for _, group := range allowedGroups {
-			if IsStringInSlice(claims.Groups, group) {
+			if util.IsStringInSlice(claims.Groups, group) {
 				return nil
 			}
 		}
 
-		log.Error().Msg("authenticated principal not in any allowed groups")
+		log.Trace().Msg("authenticated principal not in any allowed groups")
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusBadRequest)
 		_, err := writer.Write([]byte("unauthorized principal (allowed groups)"))
 		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return errOIDCAllowedGroups
@@ -466,16 +443,13 @@ func validateOIDCAllowedUsers(
 	claims *IDTokenClaims,
 ) error {
 	if len(allowedUsers) > 0 &&
-		!IsStringInSlice(allowedUsers, claims.Email) {
-		log.Error().Msg("authenticated principal does not match any allowed user")
+		!util.IsStringInSlice(allowedUsers, claims.Email) {
+		log.Trace().Msg("authenticated principal does not match any allowed user")
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusBadRequest)
 		_, err := writer.Write([]byte("unauthorized principal (user mismatch)"))
 		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return errOIDCAllowedUsers
@@ -484,29 +458,26 @@ func validateOIDCAllowedUsers(
 	return nil
 }
 
-// validateMachine retrieves machine information if it exist
+// validateNode retrieves node information if it exist
 // The error is not important, because if it does not
-// exist, then this is a new machine and we will move
+// exist, then this is a new node and we will move
 // on to registration.
-func (h *Headscale) validateMachineForOIDCCallback(
+func (h *Headscale) validateNodeForOIDCCallback(
 	writer http.ResponseWriter,
 	state string,
 	claims *IDTokenClaims,
 	expiry time.Time,
 ) (*key.NodePublic, bool, error) {
-	// retrieve machinekey from state cache
+	// retrieve nodekey from state cache
 	nodeKeyIf, nodeKeyFound := h.registrationCache.Get(state)
 	if !nodeKeyFound {
-		log.Error().
-			Msg("requested machine state key expired before authorisation completed")
+		log.Trace().
+			Msg("requested node state key expired before authorisation completed")
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusBadRequest)
 		_, err := writer.Write([]byte("state has expired"))
 		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return nil, false, errOIDCNodeKeyMissing
@@ -515,23 +486,20 @@ func (h *Headscale) validateMachineForOIDCCallback(
 	var nodeKey key.NodePublic
 	nodeKeyFromCache, nodeKeyOK := nodeKeyIf.(string)
 	if !nodeKeyOK {
-		log.Error().
-			Msg("requested machine state key is not a string")
+		log.Trace().
+			Msg("requested node state key is not a string")
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusBadRequest)
 		_, err := writer.Write([]byte("state is invalid"))
 		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
-		return nil, false, errOIDCInvalidMachineState
+		return nil, false, errOIDCInvalidNodeState
 	}
 
 	err := nodeKey.UnmarshalText(
-		[]byte(NodePublicKeyEnsurePrefix(nodeKeyFromCache)),
+		[]byte(util.NodePublicKeyEnsurePrefix(nodeKeyFromCache)),
 	)
 	if err != nil {
 		log.Error().
@@ -542,49 +510,53 @@ func (h *Headscale) validateMachineForOIDCCallback(
 		writer.WriteHeader(http.StatusBadRequest)
 		_, werr := writer.Write([]byte("could not parse node public key"))
 		if werr != nil {
-			log.Error().
-				Caller().
-				Err(werr).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return nil, false, err
 	}
 
-	// retrieve machine information if it exist
+	// retrieve node information if it exist
 	// The error is not important, because if it does not
-	// exist, then this is a new machine and we will move
+	// exist, then this is a new node and we will move
 	// on to registration.
-	machine, _ := h.GetMachineByNodeKey(nodeKey)
+	node, _ := h.db.GetNodeByNodeKey(nodeKey)
 
-	if machine != nil {
+	if node != nil {
 		log.Trace().
 			Caller().
-			Str("machine", machine.Hostname).
-			Msg("machine already registered, reauthenticating")
+			Str("node", node.Hostname).
+			Msg("node already registered, reauthenticating")
 
-		err := h.RefreshMachine(machine, expiry)
+		err := h.db.NodeSetExpiry(node, expiry)
 		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to refresh machine")
+			util.LogErr(err, "Failed to refresh node")
 			http.Error(
 				writer,
-				"Failed to refresh machine",
+				"Failed to refresh node",
 				http.StatusInternalServerError,
 			)
 
 			return nil, true, err
 		}
 		log.Debug().
-			Str("machine", machine.Hostname).
+			Str("node", node.Hostname).
 			Str("expiresAt", fmt.Sprintf("%v", expiry)).
-			Msg("successfully refreshed machine")
+			Msg("successfully refreshed node")
+
+		userName, err := getUserName(
+			writer,
+			claims,
+			h.cfg.OIDC.UseUsernameClaim,
+			h.cfg.OIDC.StripEmaildomain,
+		)
+		if err != nil {
+			userName = "unknown"
+		}
 
 		var content bytes.Buffer
 		if err := oidcCallbackTemplate.Execute(&content, oidcCallbackTemplateConfig{
-			User: claims.Email,
+			User: userName,
 			Verb: "Reauthenticated",
 		}); err != nil {
 			log.Error().
@@ -597,10 +569,7 @@ func (h *Headscale) validateMachineForOIDCCallback(
 			writer.WriteHeader(http.StatusInternalServerError)
 			_, werr := writer.Write([]byte("Could not render OIDC callback template"))
 			if werr != nil {
-				log.Error().
-					Caller().
-					Err(werr).
-					Msg("Failed to write response")
+				util.LogErr(err, "Failed to write response")
 			}
 
 			return nil, true, err
@@ -610,10 +579,7 @@ func (h *Headscale) validateMachineForOIDCCallback(
 		writer.WriteHeader(http.StatusOK)
 		_, err = writer.Write(content.Bytes())
 		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return nil, true, nil
@@ -625,22 +591,32 @@ func (h *Headscale) validateMachineForOIDCCallback(
 func getUserName(
 	writer http.ResponseWriter,
 	claims *IDTokenClaims,
+	useUsernameClaim bool,
 	stripEmaildomain bool,
 ) (string, error) {
-	userName, err := NormalizeToFQDNRules(
-		claims.Email,
+	var claim string
+	if useUsernameClaim {
+		claim = claims.Username
+	} else {
+		claim = claims.Email
+	}
+	userName, err := util.NormalizeToFQDNRules(
+		claim,
 		stripEmaildomain,
 	)
 	if err != nil {
-		log.Error().Err(err).Caller().Msgf("couldn't normalize email")
+		var friendlyErrMsg string
+		if useUsernameClaim {
+			friendlyErrMsg = "couldn't normalize username (preferred_username OIDC claim)"
+		} else {
+			friendlyErrMsg = "couldn't normalize username (email OIDC claim)"
+		}
+		log.Error().Err(err).Caller().Msgf(friendlyErrMsg)
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusInternalServerError)
-		_, werr := writer.Write([]byte("couldn't normalize email"))
+		_, werr := writer.Write([]byte(friendlyErrMsg))
 		if werr != nil {
-			log.Error().
-				Caller().
-				Err(werr).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return "", err
@@ -652,11 +628,10 @@ func getUserName(
 func (h *Headscale) findOrCreateNewUserForOIDCCallback(
 	writer http.ResponseWriter,
 	userName string,
-) (*User, error) {
-	user, err := h.GetUser(userName)
-	if errors.Is(err, ErrUserNotFound) {
-		user, err = h.CreateUser(userName)
-
+) (*types.User, error) {
+	user, err := h.db.GetUser(userName)
+	if errors.Is(err, db.ErrUserNotFound) {
+		user, err = h.db.CreateUser(userName)
 		if err != nil {
 			log.Error().
 				Err(err).
@@ -666,10 +641,7 @@ func (h *Headscale) findOrCreateNewUserForOIDCCallback(
 			writer.WriteHeader(http.StatusInternalServerError)
 			_, werr := writer.Write([]byte("could not create user"))
 			if werr != nil {
-				log.Error().
-					Caller().
-					Err(werr).
-					Msg("Failed to write response")
+				util.LogErr(err, "Failed to write response")
 			}
 
 			return nil, err
@@ -684,10 +656,7 @@ func (h *Headscale) findOrCreateNewUserForOIDCCallback(
 		writer.WriteHeader(http.StatusInternalServerError)
 		_, werr := writer.Write([]byte("could not find or create user"))
 		if werr != nil {
-			log.Error().
-				Caller().
-				Err(werr).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return nil, err
@@ -696,30 +665,26 @@ func (h *Headscale) findOrCreateNewUserForOIDCCallback(
 	return user, nil
 }
 
-func (h *Headscale) registerMachineForOIDCCallback(
+func (h *Headscale) registerNodeForOIDCCallback(
 	writer http.ResponseWriter,
-	user *User,
+	user *types.User,
 	nodeKey *key.NodePublic,
 	expiry time.Time,
 ) error {
-	if _, err := h.RegisterMachineFromAuthCallback(
+	if _, err := h.db.RegisterNodeFromAuthCallback(
+		// TODO(kradalby): find a better way to use the cache across modules
+		h.registrationCache,
 		nodeKey.String(),
 		user.Name,
 		&expiry,
-		RegisterMethodOIDC,
+		util.RegisterMethodOIDC,
 	); err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Msg("could not register machine")
+		util.LogErr(err, "could not register node")
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusInternalServerError)
-		_, werr := writer.Write([]byte("could not register machine"))
+		_, werr := writer.Write([]byte("could not register node"))
 		if werr != nil {
-			log.Error().
-				Caller().
-				Err(werr).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return err
@@ -730,11 +695,11 @@ func (h *Headscale) registerMachineForOIDCCallback(
 
 func renderOIDCCallbackTemplate(
 	writer http.ResponseWriter,
-	claims *IDTokenClaims,
+	user string,
 ) (*bytes.Buffer, error) {
 	var content bytes.Buffer
 	if err := oidcCallbackTemplate.Execute(&content, oidcCallbackTemplateConfig{
-		User: claims.Email,
+		User: user,
 		Verb: "Authenticated",
 	}); err != nil {
 		log.Error().
@@ -747,10 +712,7 @@ func renderOIDCCallbackTemplate(
 		writer.WriteHeader(http.StatusInternalServerError)
 		_, werr := writer.Write([]byte("Could not render OIDC callback template"))
 		if werr != nil {
-			log.Error().
-				Caller().
-				Err(werr).
-				Msg("Failed to write response")
+			util.LogErr(err, "Failed to write response")
 		}
 
 		return nil, err

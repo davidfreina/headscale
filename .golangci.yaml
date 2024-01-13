@@ -10,6 +10,8 @@ issues:
 linters:
   enable-all: true
   disable:
+    - depguard
+
     - exhaustivestruct
     - revive
     - lll
@@ -30,6 +32,7 @@ linters:
     - exhaustruct
     - nolintlint
     - musttag # causes issues with imported libs
+    - depguard
 
     # deprecated
     - structcheck # replaced by unused

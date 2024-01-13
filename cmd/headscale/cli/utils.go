@@ -10,6 +10,9 @@ import (
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/hscontrol"
+	"github.com/juanfont/headscale/hscontrol/policy"
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -23,7 +26,7 @@ const (
 )
 
 func getHeadscaleApp() (*hscontrol.Headscale, error) {
-	cfg, err := hscontrol.GetHeadscaleConfig()
+	cfg, err := types.GetHeadscaleConfig()
 	if err != nil {
 		return nil, fmt.Errorf(
 			"failed to load configuration while creating headscale instance: %w",
@@ -39,21 +42,23 @@ func getHeadscaleApp() (*hscontrol.Headscale, error) {
 	// We are doing this here, as in the future could be cool to have it also hot-reload
 
 	if cfg.ACL.PolicyPath != "" {
-		aclPath := hscontrol.AbsolutePathFromConfigPath(cfg.ACL.PolicyPath)
-		err = app.LoadACLPolicyFromPath(aclPath)
+		aclPath := util.AbsolutePathFromConfigPath(cfg.ACL.PolicyPath)
+		pol, err := policy.LoadACLPolicyFromPath(aclPath)
 		if err != nil {
 			log.Fatal().
 				Str("path", aclPath).
 				Err(err).
 				Msg("Could not load the ACL policy")
 		}
+
+		app.ACLPolicy = pol
 	}
 
 	return app, nil
 }
 
 func getHeadscaleCLIClient() (context.Context, v1.HeadscaleServiceClient, *grpc.ClientConn, context.CancelFunc) {
-	cfg, err := hscontrol.GetHeadscaleConfig()
+	cfg, err := types.GetHeadscaleConfig()
 	if err != nil {
 		log.Fatal().
 			Err(err).
@@ -98,7 +103,7 @@ func getHeadscaleCLIClient() (context.Context, v1.HeadscaleServiceClient, *grpc.
 		grpcOptions = append(
 			grpcOptions,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithContextDialer(hscontrol.GrpcSocketDialer),
+			grpc.WithContextDialer(util.GrpcSocketDialer),
 		)
 	} else {
 		// If we are not connecting to a local server, require an API key for authentication
@@ -149,17 +154,17 @@ func SuccessOutput(result interface{}, override string, outputFormat string) {
 	case "json":
 		jsonBytes, err = json.MarshalIndent(result, "", "\t")
 		if err != nil {
-			log.Fatal().Err(err)
+			log.Fatal().Err(err).Msg("failed to unmarshal output")
 		}
 	case "json-line":
 		jsonBytes, err = json.Marshal(result)
 		if err != nil {
-			log.Fatal().Err(err)
+			log.Fatal().Err(err).Msg("failed to unmarshal output")
 		}
 	case "yaml":
 		jsonBytes, err = yaml.Marshal(result)
 		if err != nil {
-			log.Fatal().Err(err)
+			log.Fatal().Err(err).Msg("failed to unmarshal output")
 		}
 	default:
 		//nolint

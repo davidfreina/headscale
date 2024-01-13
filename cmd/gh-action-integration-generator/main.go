@@ -31,13 +31,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  {{.Name}}:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v3
         with:
           fetch-depth: 2
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: satackey/action-docker-layer-caching@main
+        continue-on-error: true
 
       - name: Get changed files
         id: changed-files
@@ -50,10 +55,7 @@ jobs:
             integration_test/
             config-example.yaml
 
-      - uses: cachix/install-nix-action@v18
-        if: {{ "${{ env.ACT }}" }} || steps.changed-files.outputs.any_changed == 'true'
-
-      - name: Run general integration tests
+      - name: Run {{.Name}}
         if: steps.changed-files.outputs.any_changed == 'true'
         run: |
             nix develop --command -- docker run \

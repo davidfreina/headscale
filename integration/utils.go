@@ -1,6 +1,8 @@
 package integration
 
 import (
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +14,60 @@ const (
 	derpPingCount   = 10
 )
 
+func assertNoErr(t *testing.T, err error) {
+	t.Helper()
+	assertNoErrf(t, "unexpected error: %s", err)
+}
+
+func assertNoErrf(t *testing.T, msg string, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf(msg, err)
+	}
+}
+
+func assertNoErrHeadscaleEnv(t *testing.T, err error) {
+	t.Helper()
+	assertNoErrf(t, "failed to create headscale environment: %s", err)
+}
+
+func assertNoErrGetHeadscale(t *testing.T, err error) {
+	t.Helper()
+	assertNoErrf(t, "failed to get headscale: %s", err)
+}
+
+func assertNoErrListClients(t *testing.T, err error) {
+	t.Helper()
+	assertNoErrf(t, "failed to list clients: %s", err)
+}
+
+func assertNoErrListClientIPs(t *testing.T, err error) {
+	t.Helper()
+	assertNoErrf(t, "failed to get client IPs: %s", err)
+}
+
+func assertNoErrSync(t *testing.T, err error) {
+	t.Helper()
+	assertNoErrf(t, "failed to have all clients sync up: %s", err)
+}
+
+func assertNoErrListFQDN(t *testing.T, err error) {
+	t.Helper()
+	assertNoErrf(t, "failed to list FQDNs: %s", err)
+}
+
+func assertNoErrLogout(t *testing.T, err error) {
+	t.Helper()
+	assertNoErrf(t, "failed to log out tailscale nodes: %s", err)
+}
+
+func assertContains(t *testing.T, str, subStr string) {
+	t.Helper()
+	if !strings.Contains(str, subStr) {
+		t.Fatalf("%#v does not contain %#v", str, subStr)
+	}
+}
+
 func pingAllHelper(t *testing.T, clients []TailscaleClient, addrs []string) int {
 	t.Helper()
 	success := 0
@@ -20,7 +76,7 @@ func pingAllHelper(t *testing.T, clients []TailscaleClient, addrs []string) int 
 		for _, addr := range addrs {
 			err := client.Ping(addr)
 			if err != nil {
-				t.Errorf("failed to ping %s from %s: %s", addr, client.Hostname(), err)
+				t.Fatalf("failed to ping %s from %s: %s", addr, client.Hostname(), err)
 			} else {
 				success++
 			}
@@ -47,7 +103,7 @@ func pingDerpAllHelper(t *testing.T, clients []TailscaleClient, addrs []string) 
 				tsic.WithPingUntilDirect(false),
 			)
 			if err != nil {
-				t.Errorf("failed to ping %s from %s: %s", addr, client.Hostname(), err)
+				t.Fatalf("failed to ping %s from %s: %s", addr, client.Hostname(), err)
 			} else {
 				success++
 			}
@@ -75,6 +131,38 @@ func isSelfClient(client TailscaleClient, addr string) bool {
 
 	return false
 }
+
+func isCI() bool {
+	if _, ok := os.LookupEnv("CI"); ok {
+		return true
+	}
+
+	if _, ok := os.LookupEnv("GITHUB_RUN_ID"); ok {
+		return true
+	}
+
+	return false
+}
+
+func dockertestMaxWait() time.Duration {
+	wait := 60 * time.Second //nolint
+
+	if isCI() {
+		wait = 300 * time.Second //nolint
+	}
+
+	return wait
+}
+
+// func dockertestCommandTimeout() time.Duration {
+// 	timeout := 10 * time.Second //nolint
+//
+// 	if isCI() {
+// 		timeout = 60 * time.Second //nolint
+// 	}
+//
+// 	return timeout
+// }
 
 // pingAllNegativeHelper is intended to have 1 or more nodes timeing out from the ping,
 // it counts failures instead of successes.

@@ -7,7 +7,7 @@ import (
 	"strconv"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
-	"github.com/juanfont/headscale/hscontrol"
+	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/status"
@@ -94,13 +94,13 @@ var listRoutesCmd = &cobra.Command{
 
 			routes = response.Routes
 		} else {
-			response, err := client.GetMachineRoutes(ctx, &v1.GetMachineRoutesRequest{
-				MachineId: machineID,
+			response, err := client.GetNodeRoutes(ctx, &v1.GetNodeRoutesRequest{
+				NodeId: machineID,
 			})
 			if err != nil {
 				ErrorOutput(
 					err,
-					fmt.Sprintf("Cannot get routes for machine %d: %s", machineID, status.Convert(err).Message()),
+					fmt.Sprintf("Cannot get routes for node %d: %s", machineID, status.Convert(err).Message()),
 					output,
 				)
 
@@ -267,7 +267,7 @@ var deleteRouteCmd = &cobra.Command{
 
 // routesToPtables converts the list of routes to a nice table.
 func routesToPtables(routes []*v1.Route) pterm.TableData {
-	tableData := pterm.TableData{{"ID", "Machine", "Prefix", "Advertised", "Enabled", "Primary"}}
+	tableData := pterm.TableData{{"ID", "Node", "Prefix", "Advertised", "Enabled", "Primary"}}
 
 	for _, route := range routes {
 		var isPrimaryStr string
@@ -277,7 +277,7 @@ func routesToPtables(routes []*v1.Route) pterm.TableData {
 
 			continue
 		}
-		if prefix == hscontrol.ExitRouteV4 || prefix == hscontrol.ExitRouteV6 {
+		if prefix == types.ExitRouteV4 || prefix == types.ExitRouteV6 {
 			isPrimaryStr = "-"
 		} else {
 			isPrimaryStr = strconv.FormatBool(route.IsPrimary)
@@ -286,7 +286,7 @@ func routesToPtables(routes []*v1.Route) pterm.TableData {
 		tableData = append(tableData,
 			[]string{
 				strconv.FormatUint(route.Id, Base10),
-				route.Machine.GivenName,
+				route.Node.GivenName,
 				route.Prefix,
 				strconv.FormatBool(route.Advertised),
 				strconv.FormatBool(route.Enabled),

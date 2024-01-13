@@ -23,7 +23,8 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
-	"github.com/juanfont/headscale/hscontrol"
+	"github.com/juanfont/headscale/hscontrol/policy"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
 	"github.com/juanfont/headscale/integration/integrationutil"
 	"github.com/ory/dockertest/v3"
@@ -59,7 +60,7 @@ type HeadscaleInContainer struct {
 	port             int
 	extraPorts       []string
 	hostPortBindings map[string][]string
-	aclPolicy        *hscontrol.ACLPolicy
+	aclPolicy        *policy.ACLPolicy
 	env              map[string]string
 	tlsCert          []byte
 	tlsKey           []byte
@@ -72,7 +73,7 @@ type Option = func(c *HeadscaleInContainer)
 
 // WithACLPolicy adds a hscontrol.ACLPolicy policy to the
 // HeadscaleInContainer instance.
-func WithACLPolicy(acl *hscontrol.ACLPolicy) Option {
+func WithACLPolicy(acl *policy.ACLPolicy) Option {
 	return func(hsic *HeadscaleInContainer) {
 		// TODO(kradalby): Move somewhere appropriate
 		hsic.env["HEADSCALE_ACL_POLICY_PATH"] = aclPolicyPath
@@ -132,7 +133,7 @@ func WithHostPortBindings(bindings map[string][]string) Option {
 // in the Docker container name.
 func WithTestName(testName string) Option {
 	return func(hsic *HeadscaleInContainer) {
-		hash, _ := hscontrol.GenerateRandomStringDNSSafe(hsicHashLength)
+		hash, _ := util.GenerateRandomStringDNSSafe(hsicHashLength)
 
 		hostname := fmt.Sprintf("hs-%s-%s", testName, hash)
 		hsic.hostname = hostname
@@ -167,7 +168,7 @@ func New(
 	network *dockertest.Network,
 	opts ...Option,
 ) (*HeadscaleInContainer, error) {
-	hash, err := hscontrol.GenerateRandomStringDNSSafe(hsicHashLength)
+	hash, err := util.GenerateRandomStringDNSSafe(hsicHashLength)
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +212,7 @@ func New(
 	env := []string{
 		"HEADSCALE_PROFILING_ENABLED=1",
 		"HEADSCALE_PROFILING_PATH=/tmp/profile",
+		"HEADSCALE_DEBUG_DUMP_MAPRESPONSE_PATH=/tmp/mapresponses",
 	}
 	for key, value := range hsic.env {
 		env = append(env, fmt.Sprintf("%s=%s", key, value))
@@ -338,6 +340,14 @@ func (t *HeadscaleInContainer) Shutdown() error {
 		)
 	}
 
+	err = t.SaveMapResponses("/tmp/control")
+	if err != nil {
+		log.Printf(
+			"Failed to save mapresponses from control: %s",
+			fmt.Errorf("failed to save mapresponses from control: %w", err),
+		)
+	}
+
 	return t.pool.Purge(t.container)
 }
 
@@ -355,6 +365,24 @@ func (t *HeadscaleInContainer) SaveProfile(savePath string) error {
 
 	err = os.WriteFile(
 		path.Join(savePath, t.hostname+".pprof.tar"),
+		tarFile,
+		os.ModePerm,
+	)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (t *HeadscaleInContainer) SaveMapResponses(savePath string) error {
+	tarFile, err := t.FetchPath("/tmp/mapresponses")
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(
+		path.Join(savePath, t.hostname+".maps.tar"),
 		tarFile,
 		os.ModePerm,
 	)
@@ -427,9 +455,9 @@ func (t *HeadscaleInContainer) GetHostname() string {
 	return t.hostname
 }
 
-// WaitForReady blocks until the Headscale instance is ready to
+// WaitForRunning blocks until the Headscale instance is ready to
 // serve clients.
-func (t *HeadscaleInContainer) WaitForReady() error {
+func (t *HeadscaleInContainer) WaitForRunning() error {
 	url := t.GetHealthEndpoint()
 
 	log.Printf("waiting for headscale to be ready at %s", url)
@@ -519,11 +547,11 @@ func (t *HeadscaleInContainer) CreateAuthKey(
 	return &preAuthKey, nil
 }
 
-// ListMachinesInUser list the TailscaleClients (Machine, Headscale internal representation)
+// ListNodesInUser list the TailscaleClients (Node, Headscale internal representation)
 // associated with a user.
-func (t *HeadscaleInContainer) ListMachinesInUser(
+func (t *HeadscaleInContainer) ListNodesInUser(
 	user string,
-) ([]*v1.Machine, error) {
+) ([]*v1.Node, error) {
 	command := []string{"headscale", "--user", user, "nodes", "list", "--output", "json"}
 
 	result, _, err := dockertestutil.ExecuteCommand(
@@ -535,7 +563,7 @@ func (t *HeadscaleInContainer) ListMachinesInUser(
 		return nil, fmt.Errorf("failed to execute list node command: %w", err)
 	}
 
-	var nodes []*v1.Machine
+	var nodes []*v1.Node
 	err = json.Unmarshal([]byte(result), &nodes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal nodes: %w", err)
